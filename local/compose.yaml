@@ -1,0 +1,35 @@
+# Local smoke test of the exact same images, without Kubernetes.
+#   docker compose -f local/compose.yaml up --build
+#   http://localhost:8081/demo/   (httpd-0)    http://localhost:8082/demo/  (httpd-1)
+#   http://localhost:8081/mod_cluster_manager
+# Service names mirror the Kubernetes per-pod Services (httpd-0-mcmp, ...),
+# so the JBoss image defaults work unchanged.
+name: modcluster
+
+services:
+  httpd-0-mcmp:
+    build: { context: .., dockerfile: apache/Dockerfile }
+    image: modcluster-httpd:dev
+    hostname: httpd-0
+    ports: ["8081:80"]
+
+  httpd-1-mcmp:
+    image: modcluster-httpd:dev
+    hostname: httpd-1
+    ports: ["8082:80"]
+    depends_on: [httpd-0-mcmp]   # reuse the image built above
+
+  jboss-0:
+    build: { context: .., dockerfile: jboss/Dockerfile }
+    image: modcluster-jboss:dev
+    hostname: jboss-0
+    environment:
+      JAVA_OPTS: "-Xms256m -Xmx512m -Djava.net.preferIPv4Stack=true"
+    depends_on: [httpd-0-mcmp, httpd-1-mcmp]
+
+  jboss-1:
+    image: modcluster-jboss:dev
+    hostname: jboss-1
+    environment:
+      JAVA_OPTS: "-Xms256m -Xmx512m -Djava.net.preferIPv4Stack=true"
+    depends_on: [httpd-0-mcmp, httpd-1-mcmp, jboss-0]

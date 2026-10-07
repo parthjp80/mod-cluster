@@ -1,0 +1,98 @@
+# =============================================================================
+# JBoss (WildFly) application servers  (2 replicas)
+#
+# StatefulSet => stable pod names jboss-0 / jboss-1, which become the
+# mod_cluster node names (JVMRoute). Sticky sessions rely on that suffix in
+# JSESSIONID, so it must not change randomly like Deployment pod names do.
+#
+# Each pod connects OUT to httpd-0-mcmp:6666 and httpd-1-mcmp:6666 and:
+#   - registers itself (CONFIG) with its pod IP and port 8080
+#   - enables the /demo context (ENABLE-APP)
+#   - pushes its load factor every 5 s (STATUS)
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: jboss
+  labels: { app: jboss }
+spec:
+  clusterIP: None
+  selector: { app: jboss }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+    - { name: management, port: 9990, targetPort: management }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: jboss
+  labels: { app: jboss }
+spec:
+  serviceName: jboss
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: jboss }
+  template:
+    metadata:
+      labels: { app: jboss }
+    spec:
+      terminationGracePeriodSeconds: 30   # time for STOP-APP / REMOVE-APP to reach httpd
+      affinity:
+        podAntiAffinity:     # one JBoss per worker => the "cpu" metric differs per node
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: { app: jboss }
+      initContainers:
+        # The MCMP proxy names must resolve before WildFly starts.
+        # Uses the FQDN: busybox nslookup exits non-zero for a short name when
+        # any search domain returns NXDOMAIN, even though the name resolved.
+        - name: wait-for-httpd-services
+          image: busybox:1.36
+          env:
+            - name: NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          command: ["sh", "-c"]
+          args:
+            - |
+              for h in httpd-0-mcmp httpd-1-mcmp; do
+                fqdn="$h.$NAMESPACE.svc.cluster.local"
+                until nslookup "$fqdn" >/dev/null 2>&1; do echo "waiting for $fqdn"; sleep 2; done
+                echo "$fqdn resolves"
+              done
+      containers:
+        - name: jboss
+          image: modcluster-jboss        # rewritten by kustomization.yaml
+          imagePullPolicy: Always
+          env:
+            - name: NODE_NAME            # mod_cluster node name / JVMRoute
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_IP               # address httpd will proxy to
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: MODCLUSTER_PROXY1
+              value: httpd-0-mcmp:6666
+            - name: MODCLUSTER_PROXY2
+              value: httpd-1-mcmp:6666
+            - name: JAVA_OPTS            # small fixed heap => "heap" metric is easy to move
+              value: >-
+                -Xms256m -Xmx512m -XX:MetaspaceSize=96m -XX:MaxMetaspaceSize=256m
+                -Djava.net.preferIPv4Stack=true
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: management, containerPort: 9990 }
+          startupProbe:
+            httpGet: { path: /health/started, port: management }
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet: { path: /health/ready, port: management }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health/live, port: management }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 250m, memory: 640Mi }
+            limits:   { cpu: "1",  memory: 900Mi }

@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# Registers the mod_cluster subsystem in standalone.xml (the default, non-HA
+# profile) and points it at the two Apache httpd proxies.
+#
+# Runs at image build time against an embedded (offline) server, so the
+# result is baked into $JBOSS_HOME/standalone/configuration/standalone.xml.
+# See docs/standalone-xml-changes.md for the resulting XML.
+#
+# Values written as ${property:default} are resolved at server start, so the
+# same image works in Kubernetes and docker compose (entrypoint.sh sets them).
+# ---------------------------------------------------------------------------
+embed-server --server-config=standalone.xml --std-out=echo
+
+# No batch: the CLI validates batched operations against the model, and the
+# modcluster resources only exist once the extension below has been added.
+# The CLI still aborts (and the docker build fails) on the first error.
+
+# 1. mod_cluster extension (standalone.xml ships without it; only *-ha.xml have it)
+/extension=org.jboss.as.modcluster:add
+
+# 2. Where the Apache httpd MCMP listeners live (port 6666 on each httpd)
+/socket-binding-group=standard-sockets/remote-destination-outbound-socket-binding=httpd-proxy-1:add(host="${modcluster.proxy1.host:httpd-0-mcmp}", port="${modcluster.proxy1.port:6666}")
+/socket-binding-group=standard-sockets/remote-destination-outbound-socket-binding=httpd-proxy-2:add(host="${modcluster.proxy2.host:httpd-1-mcmp}", port="${modcluster.proxy2.port:6666}")
+
+# 3. The mod_cluster subsystem + proxy configuration
+#    - listener=default   : register the Undertow HTTP listener (8080), so httpd
+#                           forwards with mod_proxy_http (no AJP needed)
+#    - advertise=false    : multicast does not work on most K8s CNIs; use the
+#                           static proxy list instead
+#    - status-interval=5  : push the load factor to httpd every 5 s (default 10)
+#    - excluded-contexts  : don't publish the welcome page (/) or /wildfly-services
+#    (adding the proxy auto-creates a static "simple" load provider; replaced in step 4)
+/subsystem=modcluster:add
+/subsystem=modcluster/proxy=default:add(listener=default, proxies=[httpd-proxy-1, httpd-proxy-2], advertise=false, balancer=mycluster, sticky-session=true, sticky-session-remove=false, sticky-session-force=false, status-interval=5, ping=10, node-timeout=20, stop-context-timeout=10, excluded-contexts="ROOT,wildfly-services")
+
+# 4. Dynamic load provider: the load factor sent to httpd is computed from
+#    these weighted metrics:
+#        load factor = 100 - 100 * (weighted average of metric loads, 0..1)
+#    history/decay: keep the last 4 samples, each older one counts half as much.
+#
+#    busyness with Undertow = running requests / capacity. Undertow reports no
+#    max-threads, so WITHOUT capacity a single in-flight request = 100% busy.
+#    capacity=40 matches the worker pool size set in step 5.
+/subsystem=modcluster/proxy=default/load-provider=simple:remove
+/subsystem=modcluster/proxy=default/load-provider=dynamic:add(decay=2, history=4)
+/subsystem=modcluster/proxy=default/load-provider=dynamic/load-metric=heap:add(type=heap, weight=2)
+/subsystem=modcluster/proxy=default/load-provider=dynamic/load-metric=busyness:add(type=busyness, weight=2, capacity=40)
+/subsystem=modcluster/proxy=default/load-provider=dynamic/load-metric=cpu:add(type=cpu, weight=1)
+
+# 5. Fixed-size request worker pool (40 threads), so "40 concurrent requests"
+#    really is the saturation point the busyness capacity assumes.
+/subsystem=io/worker=default:write-attribute(name=task-max-threads, value=40)
+
+stop-embedded-server

@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: modcluster
+
+resources:
+  - namespace.yaml
+  - httpd.yaml
+  - jboss.yaml
+  - networkpolicy.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: modcluster-demo
+    includeSelectors: false
+
+# Point these at wherever you pushed the images (see Makefile: REGISTRY / TAG)
+images:
+  - name: modcluster-httpd
+    newName: ghcr.io/parthjp80/modcluster-httpd
+    newTag: "1.0.1"
+  - name: modcluster-jboss
+    newName: ghcr.io/parthjp80/modcluster-jboss
+    newTag: "1.0.1"

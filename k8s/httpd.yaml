@@ -1,0 +1,104 @@
+# =============================================================================
+# Apache httpd + mod_cluster  (2 replicas)
+#
+#   httpd-frontend  LoadBalancer (MetalLB)  :80   -> both httpd pods (user traffic)
+#   httpd-0-mcmp    ClusterIP               :6666 -> httpd-0 only   (JBoss registers here)
+#   httpd-1-mcmp    ClusterIP               :6666 -> httpd-1 only   (JBoss registers here)
+#   httpd           headless (StatefulSet governing service)
+#
+# Why one ClusterIP Service per httpd pod?  Every JBoss node must register with
+# EVERY httpd individually (each httpd keeps its own node table in shared
+# memory). A per-pod Service gives each httpd a stable name AND a stable IP
+# that survives pod restarts - JBoss resolves the proxy address once at start.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: httpd
+  labels: { app: httpd }
+spec:
+  clusterIP: None
+  selector: { app: httpd }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+    - { name: mcmp, port: 6666, targetPort: mcmp }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: httpd-0-mcmp
+  labels: { app: httpd }
+spec:
+  type: ClusterIP
+  selector:
+    app: httpd
+    statefulset.kubernetes.io/pod-name: httpd-0
+  ports:
+    - { name: mcmp, port: 6666, targetPort: mcmp }
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: httpd-1-mcmp
+  labels: { app: httpd }
+spec:
+  type: ClusterIP
+  selector:
+    app: httpd
+    statefulset.kubernetes.io/pod-name: httpd-1
+  ports:
+    - { name: mcmp, port: 6666, targetPort: mcmp }
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: httpd-frontend
+  labels: { app: httpd }
+spec:
+  type: LoadBalancer          # MetalLB hands out an IP from its pool
+  selector: { app: httpd }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: httpd
+  labels: { app: httpd }
+spec:
+  serviceName: httpd
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: httpd }
+  template:
+    metadata:
+      labels: { app: httpd }
+    spec:
+      affinity:
+        podAntiAffinity:     # spread the two Apaches over different nodes
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: { app: httpd }
+      containers:
+        - name: httpd
+          image: modcluster-httpd        # rewritten by kustomization.yaml
+          imagePullPolicy: Always
+          ports:
+            - { name: http, containerPort: 80 }
+            - { name: mcmp, containerPort: 6666 }
+          readinessProbe:
+            tcpSocket: { port: mcmp }
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
